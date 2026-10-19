@@ -7,25 +7,65 @@ project's event generator emits student activity events with `version`,
 publishes an `ActivityCompleted` event in that shape. SQS holds the event until
 a worker is ready to consume it.
 
-```text
-Change the template -> pull request -> CI: lint and preview
-                                  -> merge to main -> CD: deploy and smoke test
+## How the pieces fit together
 
-EdTech app -> SNS topic -> SQS queue -> EventBridge Pipes -> Firehose -> S3
+This diagram shows both the software delivery path and the small AWS event path
+that the lab deploys:
+
+```mermaid
+flowchart LR
+    Edit["Edit CloudFormation template"] --> PR["Open pull request"]
+    PR --> CI["GitHub Actions: lint and preview"]
+    CI --> Review["Review and merge to main"]
+    Review --> Deploy["GitHub Actions: deploy"]
+    Deploy --> OIDC["GitHub OIDC: short-lived AWS credentials"]
+    OIDC --> DeployRole["AWS deploy role"]
+    DeployRole --> CFN["CloudFormation uses execution role"]
+    CFN --> Topic["SNS topic"]
+    Topic --> Queue["SQS queue"]
+    Deploy --> Test["Smoke test publishes and checks an event"]
+    Test --> Topic
+    Queue -. "event received" .-> Test
 ```
 
-**CI (continuous integration)** checks a proposed change before it is merged.
-Here, `cfn-lint` checks both CloudFormation templates. The PR job also asks AWS
-to validate the demo template and, once a demo stack exists, creates a temporary
-CloudFormation *change set* showing what would change. It never executes that
-change set.
+The longer Lexia event pipeline can later continue from SQS through EventBridge
+Pipes, Firehose, and S3. This first exercise stops at SQS so the deployment
+steps stay small enough to inspect.
 
-**CD (continuous deployment in this lab)** applies a merged change. Here, a
-push to `main` deploys the demo stack and then publishes an `ActivityCompleted`
-event to SNS, receives it from SQS, and deletes it. If you configure a required
-environment reviewer, the deployment waits for that approval; this is a
-continuous delivery style. A green deployment means the wiring actually
-worked, not just that the template was syntactically valid.
+## Why these tools?
+
+### Why GitHub Actions?
+
+GitHub Actions runs automation next to the code in this repository. The
+workflow in `.github/workflows/demo-stack.yml` is a set of repeatable steps:
+
+- On a pull request, **CI (continuous integration)** lints the templates and,
+  for a branch in this repository, asks AWS to preview changes. This catches
+  mistakes before they are merged. A fork can run lint, but does not get AWS
+  access.
+- After a change reaches `main`, **CD (continuous deployment)** deploys the
+  stack and sends a test event through SNS to SQS. That proves the AWS resources
+  work together, not only that the YAML is valid. If you configure a required
+  reviewer for the `demo-deploy` environment, GitHub pauses the deployment for
+  approval first.
+
+GitHub uses AWS OIDC to request short-lived credentials for each run. This
+avoids saving long-lived AWS access keys in GitHub. Separate plan, deploy, and
+CloudFormation execution roles limit which actions each part can perform.
+
+### Why CloudFormation?
+
+CloudFormation is AWS's infrastructure-as-code service. The YAML template
+describes the SNS topic, SQS queue, permissions, and subscription that make up
+the demo. CloudFormation creates or updates those resources as one named
+**stack**. Keeping the description in Git means changes can be reviewed,
+versioned, and repeated without manually rebuilding resources in the console.
+
+For an existing stack, the pull request workflow creates a temporary **change
+set**. It lists the AWS resource actions CloudFormation plans to take, including
+whether a resource may be replaced. The workflow displays and then deletes this
+preview; it does not apply it. Deployment happens after a change is merged to
+`main`.
 
 ## What is in this folder
 
@@ -42,25 +82,59 @@ credentials through OIDC; no AWS access key is stored in GitHub.
 
 ## Prerequisites
 
-- An AWS account where you are allowed to create CloudFormation, IAM, SNS, and
-  SQS resources, plus AWS CLI v2 configured locally.
-- A GitHub repository containing the **contents of this `demo_cicd` folder at
-  the repository root**. The workflow expects `infra/demo/...` paths relative
-  to that root. This lab is already pushed to
-  [visuvishwa99/aws_cicd](https://github.com/visuvishwa99/aws_cicd).
-- A `main` branch with GitHub Actions enabled. Use a disposable AWS account or
-  a region where this practice stack will not collide with existing resources.
-  AWS resources may incur charges; delete the stacks when finished.
+Before running the lab, make sure you have:
 
-Run these commands in PowerShell from the repository root (the directory that
-contains `.github` and `infra`):
+1. **A GitHub account with access to this repository.** GitHub Actions must be
+   enabled. The workflow expects the contents of this `demo_cicd` directory at
+   the repository root, where `.github` and `infra` live. This lab is already
+   pushed to [visuvishwa99/aws_cicd](https://github.com/visuvishwa99/aws_cicd).
+2. **An AWS account and permission to create IAM roles and an OIDC provider,
+   CloudFormation stacks, SNS topics, and SQS queues.** The bootstrap step needs
+   IAM permissions; the deployed stack uses SNS and SQS. If you cannot create
+   IAM roles, ask an account administrator to perform the one-time bootstrap.
+3. **AWS CLI v2 and Git installed locally.** Configure the AWS CLI with a
+   profile, AWS IAM Identity Center (SSO), or another supported login method.
+   Do not put AWS access keys in the repository.
+4. **PowerShell** for the commands below. The workflow itself runs on GitHub's
+   hosted Linux runner, so you do not need Linux on your computer.
+5. **A region to use consistently.** The existing lab is configured for
+   `us-east-1`. AWS resources can incur charges, so review current pricing and
+   remove the stacks when finished.
+
+If you do not already have the lab on your computer, clone it and enter the
+repository folder:
 
 ```powershell
-$Region = 'us-east-1' # choose your region and use it consistently
+git clone https://github.com/visuvishwa99/aws_cicd.git
+Set-Location aws_cicd
+```
+
+These checks help confirm that Git, the AWS CLI, and your AWS login are ready.
+Run them in PowerShell from the repository root (the directory that contains
+`.github` and `infra`):
+
+```powershell
+$Region = 'us-east-1'
+git --version
+aws --version
 aws sts get-caller-identity
+aws configure list
 aws cloudformation validate-template --template-body file://infra/demo/bootstrap-github-roles.yml --region $Region
 aws cloudformation validate-template --template-body file://infra/demo/sns-sqs-demo.yml --region $Region
 ```
+
+`get-caller-identity` shows which AWS account and identity your CLI will use.
+Check that the account is the one where you intend to create resources. The
+two `validate-template` commands check that AWS can parse the templates; they
+do not create anything. The GitHub Actions workflow installs `cfn-lint` for its
+own checks, so installing it locally is optional.
+If you use a named AWS CLI profile, select it first with
+`$env:AWS_PROFILE = 'your-profile-name'` so the checks run against the intended
+account.
+
+The AWS and GitHub setup for this repository has already been completed. The
+bootstrap and GitHub configuration steps below explain how it was set up and
+are needed if you repeat the lab in a different repository or AWS account.
 
 ## 1. Bootstrap AWS access once
 
