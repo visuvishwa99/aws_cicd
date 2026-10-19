@@ -1,0 +1,241 @@
+name: SNS/SQS demo stack
+
+# CI:  every pull request lints the templates and previews changes to an existing stack.
+# CD:  every merge to main deploys the stack and runs a smoke test.
+on:
+  pull_request:
+    paths:
+      - "infra/demo/sns-sqs-demo.yml"
+      - "infra/demo/bootstrap-github-roles.yml"
+      - ".github/workflows/demo-stack.yml"
+  push:
+    branches: [main]
+    paths:
+      - "infra/demo/sns-sqs-demo.yml"
+      - "infra/demo/bootstrap-github-roles.yml"
+      - ".github/workflows/demo-stack.yml"
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  STACK_NAME: learn-sns-sqs
+  TEMPLATE: infra/demo/sns-sqs-demo.yml
+  ENV_NAME: learn
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------- CI: lint
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cfn-lint
+        run: python -m pip install "cfn-lint>=1,<2"
+
+      - name: Lint templates
+        run: cfn-lint "$TEMPLATE" infra/demo/bootstrap-github-roles.yml
+
+  # ---------------------------------------------------------------- CI: preview
+  plan:
+    # Fork PRs can run lint, but do not receive an AWS OIDC token.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (plan role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEMO_PLAN_ROLE_ARN }}
+          role-session-name: plan-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate template with AWS
+        run: aws cloudformation validate-template --template-body "file://$TEMPLATE" > /dev/null
+
+      - name: Check whether the demo stack exists
+        id: stack
+        run: |
+          set -euo pipefail
+          if STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query 'Stacks[0].StackStatus' --output text 2>&1); then
+            case "$STATUS" in
+              CREATE_COMPLETE|UPDATE_COMPLETE)
+                echo "exists=true" >> "$GITHUB_OUTPUT"
+                ;;
+              *)
+                echo "::error::Stack $STACK_NAME is $STATUS. Resolve that status before previewing."
+                exit 1
+                ;;
+            esac
+          elif [[ "$STATUS" == *"does not exist"* ]]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "## First deployment" >> "$GITHUB_STEP_SUMMARY"
+            echo "The template is valid, but $STACK_NAME does not exist yet. Merge to main to create it; later PRs will show a change set." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::Could not inspect $STACK_NAME: $STATUS"
+            exit 1
+          fi
+
+      - name: Create change set
+        if: steps.stack.outputs.exists == 'true'
+        id: changeset
+        env:
+          EXEC_ROLE_ARN: ${{ vars.DEMO_CFN_EXEC_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          CS_NAME="pr-${{ github.event.pull_request.number }}-run-${{ github.run_id }}"
+          echo "name=$CS_NAME" >> "$GITHUB_OUTPUT"
+
+          aws cloudformation create-change-set \
+            --stack-name "$STACK_NAME" \
+            --change-set-name "$CS_NAME" \
+            --change-set-type UPDATE \
+            --template-body "file://$TEMPLATE" \
+            --parameters "ParameterKey=EnvName,ParameterValue=$ENV_NAME" \
+            --role-arn "$EXEC_ROLE_ARN" > /dev/null
+
+          aws cloudformation wait change-set-create-complete \
+            --stack-name "$STACK_NAME" --change-set-name "$CS_NAME" || true
+
+      - name: Show planned changes
+        if: steps.stack.outputs.exists == 'true'
+        env:
+          CS_NAME: ${{ steps.changeset.outputs.name }}
+        run: |
+          set -euo pipefail
+          CS_STATUS=$(aws cloudformation describe-change-set --stack-name "$STACK_NAME" \
+                        --change-set-name "$CS_NAME" --query Status --output text)
+          REASON=$(aws cloudformation describe-change-set --stack-name "$STACK_NAME" \
+                     --change-set-name "$CS_NAME" --query StatusReason --output text)
+
+          {
+            echo "## CloudFormation preview for \`$STACK_NAME\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$CS_STATUS" = "FAILED" ]; then
+            if echo "$REASON" | grep -qiE "didn't contain changes|No updates"; then
+              echo "No changes. Merging will not modify AWS." | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Change set failed: $REASON" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            echo "| Action | Logical ID | Type | Replacement |"
+            echo "|---|---|---|---|"
+            aws cloudformation describe-change-set --stack-name "$STACK_NAME" \
+              --change-set-name "$CS_NAME" \
+              --query 'Changes[].ResourceChange.[Action,LogicalResourceId,ResourceType,Replacement]' \
+              --output text | awk -F'\t' '{printf "| %s | %s | %s | %s |\n", $1, $2, $3, $4}'
+            echo
+            echo "**Replacement = True** means the resource is deleted and recreated."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Delete preview change set
+        if: always() && steps.changeset.outputs.name != ''
+        env:
+          CS_NAME: ${{ steps.changeset.outputs.name }}
+        run: |
+          aws cloudformation delete-change-set \
+            --stack-name "$STACK_NAME" --change-set-name "$CS_NAME" || true
+
+  # ---------------------------------------------------------------- CD: deploy
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: demo-deploy
+    concurrency:
+      group: demo-stack-deploy
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEMO_DEPLOY_ROLE_ARN }}
+          role-session-name: deploy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy stack
+        env:
+          EXEC_ROLE_ARN: ${{ vars.DEMO_CFN_EXEC_ROLE_ARN }}
+        run: |
+          aws cloudformation deploy \
+            --stack-name "$STACK_NAME" \
+            --template-file "$TEMPLATE" \
+            --parameter-overrides "EnvName=$ENV_NAME" \
+            --role-arn "$EXEC_ROLE_ARN" \
+            --no-fail-on-empty-changeset
+
+      - name: Show outputs
+        run: |
+          aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs' --output table | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke test (publish to SNS, receive from SQS)
+        run: |
+          set -euo pipefail
+          TOPIC_ARN=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='TopicArn'].OutputValue" --output text)
+          QUEUE_URL=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='QueueUrl'].OutputValue" --output text)
+          MARKER="$(cat /proc/sys/kernel/random/uuid)"
+          EVENT=$(jq -cn --arg marker "$MARKER" --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
+            version: "1.0",
+            changeType: "ActivityCompleted",
+            eventInfo: {eventName: "ActivityPositionChanged", source: "alpha_app"},
+            payload: {
+              student_id: "STU1000",
+              product_name: "alpha",
+              unit_id: "U01",
+              strand_id: "STR01",
+              level_id: "Beginner",
+              activity_id: "ACT100",
+              attempt_timestamp: $timestamp,
+              is_completed: true,
+              session_id: $marker,
+              school_id: "SCH001",
+              grade_level: "Grade 1"
+            }
+          }')
+
+          aws sns publish --topic-arn "$TOPIC_ARN" \
+            --message "$EVENT" > /dev/null
+
+          for attempt in 1 2 3 4 5 6; do
+            MSGS=$(aws sqs receive-message --queue-url "$QUEUE_URL" \
+                     --max-number-of-messages 10 --wait-time-seconds 5 --output json)
+            HANDLE=$(echo "$MSGS" | jq -r --arg m "$MARKER" \
+                     '.Messages[]? | select(.Body | contains($m)) | .ReceiptHandle' | head -n1)
+            if [ -n "$HANDLE" ]; then
+              aws sqs delete-message --queue-url "$QUEUE_URL" --receipt-handle "$HANDLE"
+              echo "Smoke test passed: ActivityCompleted event $MARKER went SNS -> SQS." | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Attempt $attempt: not received yet"
+          done
+
+          echo "::error::Smoke test failed: message did not reach the queue."
+          exit 1

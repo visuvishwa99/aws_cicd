@@ -1,0 +1,198 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  ONE-TIME bootstrap for the SNS/SQS demo pipeline. Deploy this by hand once.
+  It creates the IAM roles GitHub Actions uses, so the pipeline cannot create
+  its own permissions.
+
+  PlanRole    - assumed by pull-request jobs. Can preview changes, cannot apply them.
+  DeployRole  - assumed only by the demo-deploy environment (main branch). Can apply changes.
+  ExecRole    - assumed by CloudFormation itself. Holds the SNS/SQS permissions.
+
+Parameters:
+  GitHubRepository:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+  DeployEnvironment:
+    Type: String
+    Default: demo-deploy
+    Description: GitHub Environment allowed to apply changes.
+  DemoStackName:
+    Type: String
+    Default: learn-sns-sqs
+  DemoEnvName:
+    Type: String
+    Default: learn
+    Description: Must match the EnvName parameter of the demo stack.
+  ExistingGitHubOidcProviderArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Leave empty to create the GitHub OIDC provider. If the account already
+      has one for token.actions.githubusercontent.com, paste its ARN here.
+
+Conditions:
+  CreateGitHubOidcProvider: !Equals [!Ref ExistingGitHubOidcProviderArn, '']
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateGitHubOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+
+  # ------------------------------------------------------------ ExecRole
+  # CloudFormation uses this role to create the SNS topic and SQS queue.
+  # Scoped to resources named "<DemoEnvName>-demo-*".
+  ExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: CloudFormation execution role for the SNS/SQS demo stack.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: demo-resources
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ManageDemoTopic
+                Effect: Allow
+                Action: 'sns:*'
+                Resource: !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${DemoEnvName}-demo-*'
+              - Sid: ManageDemoQueue
+                Effect: Allow
+                Action: 'sqs:*'
+                Resource: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${DemoEnvName}-demo-*'
+
+  # ------------------------------------------------------------ PlanRole
+  PlanRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Pull-request jobs preview changes to the demo stack.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateGitHubOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Ref ExistingGitHubOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+                'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubRepository}:pull_request'
+      Policies:
+        - PolicyName: preview-demo-stack
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PreviewChanges
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${DemoStackName}/*'
+              - Sid: ValidateTemplates
+                Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: '*'
+              - Sid: PassExecRoleToCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt ExecRole.Arn
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': cloudformation.amazonaws.com
+
+  # ------------------------------------------------------------ DeployRole
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: The demo-deploy environment applies changes to the demo stack.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateGitHubOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Ref ExistingGitHubOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+                'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubRepository}:environment:${DeployEnvironment}'
+      Policies:
+        - PolicyName: deploy-demo-stack
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DeployStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${DemoStackName}/*'
+              - Sid: ValidateTemplates
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:GetTemplateSummary
+                Resource: '*'
+              - Sid: PassExecRoleToCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt ExecRole.Arn
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': cloudformation.amazonaws.com
+              # Used only by the smoke test after deploy.
+              - Sid: SmokeTestPublish
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${DemoEnvName}-demo-*'
+              - Sid: SmokeTestReceive
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueUrl
+                Resource: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${DemoEnvName}-demo-*'
+
+Outputs:
+  PlanRoleArn:
+    Description: GitHub repository variable DEMO_PLAN_ROLE_ARN
+    Value: !GetAtt PlanRole.Arn
+  DeployRoleArn:
+    Description: GitHub repository variable DEMO_DEPLOY_ROLE_ARN
+    Value: !GetAtt DeployRole.Arn
+  ExecRoleArn:
+    Description: GitHub repository variable DEMO_CFN_EXEC_ROLE_ARN
+    Value: !GetAtt ExecRole.Arn
+  GitHubOidcProviderArn:
+    Description: Reuse this ARN in other stacks (such as the dbt stack)
+    Value: !If
+      - CreateGitHubOidcProvider
+      - !Ref GitHubOidcProvider
+      - !Ref ExistingGitHubOidcProviderArn

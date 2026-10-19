@@ -1,0 +1,59 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Learning stack - an SNS topic that delivers messages to an SQS queue.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: learn
+    AllowedPattern: '^[a-z0-9-]{2,20}$'
+    Description: Short name added to resource names.
+
+Resources:
+  # 1. The SNS topic (like: aws sns create-topic)
+  DemoTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvName}-demo-topic'
+
+  # 2. The SQS queue (like: aws sqs create-queue)
+  DemoQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${EnvName}-demo-queue'
+      MessageRetentionPeriod: 345600   # 4 days
+      SqsManagedSseEnabled: true
+
+  # 3. Let the topic send to the queue (like: aws sqs set-queue-attributes --attributes Policy=...)
+  DemoQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DemoQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowTopicToSend
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt DemoQueue.Arn
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !Ref DemoTopic
+
+  # 4. Subscribe the queue to the topic (like: aws sns subscribe --protocol sqs)
+  DemoSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DemoTopic
+      Protocol: sqs
+      Endpoint: !GetAtt DemoQueue.Arn
+
+Outputs:
+  TopicArn:
+    Value: !Ref DemoTopic
+  QueueUrl:
+    Value: !Ref DemoQueue
+  QueueArn:
+    Value: !GetAtt DemoQueue.Arn
