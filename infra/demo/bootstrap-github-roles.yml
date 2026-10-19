@@ -12,6 +12,12 @@ Parameters:
   GitHubRepository:
     Type: String
     AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+  GitHubOidcSubjectPrefix:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional immutable GitHub OIDC subject prefix, such as
+      repo:OWNER@OWNER_ID/REPO@REPO_ID. Leave empty for the legacy name-only format.
   DeployEnvironment:
     Type: String
     Default: demo-deploy
@@ -32,6 +38,7 @@ Parameters:
 
 Conditions:
   CreateGitHubOidcProvider: !Equals [!Ref ExistingGitHubOidcProviderArn, '']
+  UseGitHubOidcSubjectPrefix: !Not [!Equals [!Ref GitHubOidcSubjectPrefix, '']]
 
 Resources:
   GitHubOidcProvider:
@@ -89,7 +96,10 @@ Resources:
             Condition:
               StringEquals:
                 'token.actions.githubusercontent.com:aud': sts.amazonaws.com
-                'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubRepository}:pull_request'
+                'token.actions.githubusercontent.com:sub': !If
+                  - UseGitHubOidcSubjectPrefix
+                  - !Sub '${GitHubOidcSubjectPrefix}:pull_request'
+                  - !Sub 'repo:${GitHubRepository}:pull_request'
       Policies:
         - PolicyName: preview-demo-stack
           PolicyDocument:
@@ -136,7 +146,10 @@ Resources:
             Condition:
               StringEquals:
                 'token.actions.githubusercontent.com:aud': sts.amazonaws.com
-                'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubRepository}:environment:${DeployEnvironment}'
+                'token.actions.githubusercontent.com:sub': !If
+                  - UseGitHubOidcSubjectPrefix
+                  - !Sub '${GitHubOidcSubjectPrefix}:environment:${DeployEnvironment}'
+                  - !Sub 'repo:${GitHubRepository}:environment:${DeployEnvironment}'
       Policies:
         - PolicyName: deploy-demo-stack
           PolicyDocument:

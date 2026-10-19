@@ -74,13 +74,17 @@ aws iam list-open-id-connect-providers --output table
 If it exists, pass its ARN as an additional parameter in the command below:
 `ExistingGitHubOidcProviderArn=arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com`.
 Otherwise, the bootstrap stack creates it. Replace `OWNER/REPO` with the exact
-GitHub repository name.
+GitHub repository name. Repositories created after 2026-07-15 use immutable
+OIDC subjects, so also pass `GitHubOidcSubjectPrefix=repo:OWNER@OWNER_ID/REPO@REPO_ID`.
+Find the numeric owner and repository IDs in the repository's GitHub API record.
+For this lab, the prefix is
+`repo:visuvishwa99@136651017/aws_cicd@1426014114`.
 
 ```powershell
 aws cloudformation deploy `
   --stack-name learn-sns-sqs-bootstrap `
   --template-file infra/demo/bootstrap-github-roles.yml `
-  --parameter-overrides GitHubRepository=OWNER/REPO `
+  --parameter-overrides GitHubRepository=OWNER/REPO GitHubOidcSubjectPrefix=repo:OWNER@OWNER_ID/REPO@REPO_ID `
   --capabilities CAPABILITY_IAM `
   --region $Region
 
