@@ -46,8 +46,8 @@ credentials through OIDC; no AWS access key is stored in GitHub.
   SQS resources, plus AWS CLI v2 configured locally.
 - A GitHub repository containing the **contents of this `demo_cicd` folder at
   the repository root**. The workflow expects `infra/demo/...` paths relative
-  to that root. This folder is now an initialized local Git repository; it has
-  not yet been pushed to GitHub.
+  to that root. This lab is already pushed to
+  [visuvishwa99/aws_cicd](https://github.com/visuvishwa99/aws_cicd).
 - A `main` branch with GitHub Actions enabled. Use a disposable AWS account or
   a region where this practice stack will not collide with existing resources.
   AWS resources may incur charges; delete the stacks when finished.
@@ -112,19 +112,27 @@ between CI and deployment. The IAM deploy role trusts this environment name,
 so the spelling must match. The plan job uses the PR identity. Use a PR branch
 in the same repository for the AWS preview; fork PRs run lint only.
 
+For this repository, these settings already point to the `learn-sns-sqs-bootstrap`
+stack in account `191399301049`, region `us-east-1`. The repository variables
+contain only the region and IAM role ARNs; they do not contain AWS access keys.
+
 ## 3. Run the lab
 
-1. Open a PR that changes `infra/demo/sns-sqs-demo.yml`. For a harmless first
+1. The initial SNS-to-SQS stack is already deployed. To see the full CI/CD
+   path now, open **Actions → SNS/SQS demo stack → Run workflow** on `main`.
+   Watch **lint**, **deploy**, and the **smoke test**. The workflow publishes a
+   uniquely marked activity event, receives it from SQS, then removes it.
+2. Open a PR that changes `infra/demo/sns-sqs-demo.yml`. For a harmless first
    edit, change the template `Description`. Watch **lint**, then **plan** in
-   the Actions run. On the first PR, the plan says the stack does not exist yet;
-   creating a change set for a new stack would leave a placeholder stack.
-2. Merge the PR to `main`. Watch **lint**, **deploy**, and the **smoke test**.
+   the Actions run. The plan job creates a change set for the deployed stack;
+   inspect its proposed action before merging.
+3. Merge the PR to `main`. Watch **lint**, **deploy**, and the **smoke test**.
    In AWS CloudFormation, inspect `learn-sns-sqs` and its **Resources** and
    **Outputs** tabs. No deployment happens from a PR.
-3. Create a second PR. Change `MessageRetentionPeriod` in the queue from
+4. Create a second PR. Change `MessageRetentionPeriod` in the queue from
    `345600` (4 days) to `172800` (2 days). The PR change set should show a
    queue **Modify** action. Read the `Replacement` column before merging.
-4. Merge and verify the smoke test passes again. Check the queue in the SQS
+5. Merge and verify the smoke test passes again. Check the queue in the SQS
    console or inspect the stack events to connect each pipeline step to an
    AWS action.
 
